@@ -1,0 +1,28 @@
+[project]
+name = "abs-sync"
+version = "0.1.0"
+description = "Sync Audiobookshelf listening sessions to Toggl Track"
+readme = "README.md"
+authors = [
+    { name = "Jack Kehler", email = "jtkehler@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "filelock>=4.0.3",
+    "platformdirs>=4.11.12",
+    "requests>=2.34.2",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+abs-sync = "abs_sync:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.1",
+    "ruff>=0.16.8",
+]
