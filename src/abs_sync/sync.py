@@ -35,6 +35,17 @@ class SyncError(Exception):
     """A source, transport, data or state failure."""
 
 
+class _NegativeListeningTime(SyncError):
+    """An identifiable source session to defer without changing its Toggl entry."""
+
+    def __init__(self, session_id: str, user_id: str, value: float) -> None:
+        super().__init__(
+            f"Audiobookshelf session {session_id} has negative timeListening ({value})"
+        )
+        self.session_id: str = session_id
+        self.user_id: str = user_id
+
+
 @dataclass(frozen=True)
 class Config:
     abs_url: str
@@ -243,7 +254,8 @@ def run_sync(
         log(
             f"{prefix}: created {counts['created']}, updated {counts['updated']}, "
             + f"unchanged {counts['unchanged']}, skipped {counts['skipped']} "
-            + f"(before boundary, zero-length or below minimum), deferred {counts['deferred']}"
+            + "(before boundary, zero-length or below minimum), "
+            + f"deferred {counts['deferred']} (request budget)"
         )
 
 
@@ -332,6 +344,7 @@ def _fetch_sessions(
     conflicts: set[str] = set()
     users: set[str] = set()
     unsupported: set[str] = set()
+    negative: set[str] = set()
     anonymous = 0
     for fields in _fetch_history(config):
         if fields.get("mediaType") not in ("book", "podcast"):
@@ -341,7 +354,13 @@ def _fetch_sessions(
             else:
                 anonymous += 1
             continue
-        session = _listening_session(fields)
+        try:
+            session = _listening_session(fields)
+        except _NegativeListeningTime as exc:
+            users.add(exc.user_id)
+            negative.add(exc.session_id)
+            log(f"deferred: {exc}; will recheck on the next run")
+            continue
         users.add(session.user_id)
         if sessions.setdefault(session.session_id, session) != session:
             conflicts.add(session.session_id)
@@ -350,7 +369,7 @@ def _fetch_sessions(
             "Audiobookshelf history contains sessions of more than one user"
         )
     # A changing paginated history can repeat an ID with disagreeing values.
-    conflicts.update(sessions.keys() & unsupported)
+    conflicts.update(sessions.keys() & (unsupported | negative))
     for session_id in conflicts:
         del sessions[session_id]
     if conflicts:
@@ -368,19 +387,24 @@ def _listening_session(fields: Mapping[str, object]) -> ListeningSession:
     if not isinstance(user_id, str) or not user_id.strip():
         raise SyncError(f"Audiobookshelf session {session_id} has an invalid userId")
     values: list[int] = []
+    negative_time: float | None = None
     for key in ("startedAt", "timeListening"):
         value = fields.get(key)
         if (
             isinstance(value, bool)
             or not isinstance(value, int | float)
-            or value < 0
             or isinstance(value, float)
             and not math.isfinite(value)
         ):
             raise SyncError(f"Audiobookshelf session {session_id} has an invalid {key}")
+        if value < 0:
+            if key == "timeListening":
+                negative_time = value
+            else:
+                raise SyncError(f"Audiobookshelf session {session_id} has an invalid {key}")
         values.append(math.floor(value))
     start_s, duration = values[0] // 1000, values[1]
-    if start_s + duration > 253_402_300_799:
+    if start_s + max(duration, 0) > 253_402_300_799:
         raise SyncError(
             f"Audiobookshelf session {session_id} exceeds the calendar range"
         )
@@ -400,6 +424,9 @@ def _listening_session(fields: Mapping[str, object]) -> ListeningSession:
         raise SyncError(
             f"Audiobookshelf session {session_id} has no usable title or libraryItemId"
         )
+    # Only defer after checking the rest of the session for malformed values.
+    if negative_time is not None:
+        raise _NegativeListeningTime(session_id, user_id, negative_time)
     return ListeningSession(session_id, user_id, title, start_s, duration)
 
 

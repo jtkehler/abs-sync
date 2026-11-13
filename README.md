@@ -91,6 +91,13 @@ Toggl requests are sent per rolling hour across all runs; remaining work waits
 for later runs, updates before creates. A 402 or 429 from Toggl stops the run
 and sets a cooldown.
 
+If Audiobookshelf returns a negative `timeListening`, that session is deferred
+with a warning while valid sessions continue. Any existing Toggl entry is left
+unchanged, and the session is reconsidered on every run, so it can sync once its
+listening time becomes valid. These source warnings are separate from the
+request-budget deferral count. Other malformed source values still stop the run
+before any Toggl requests.
+
 Dry runs use an in-memory copy of the existing database, so they share the real
 comparison and request-budget logic without changing saved state. Output lists
 creates/updates and a short count of unchanged, skipped and deferred sessions.
@@ -148,7 +155,7 @@ duration are overwritten the next time its Audiobookshelf session changes.
 
 | Status | Meaning |
 | --- | --- |
-| 0 | Success, nothing to do, or work deferred by the request budget |
+| 0 | Success, nothing to do, or work deferred (see output) |
 | 1 | Audiobookshelf, network, data or state error; unresolved or rejected writes |
 | 2 | Invalid command line or configuration |
 | 75 | Another abs-sync run holds the state lock |

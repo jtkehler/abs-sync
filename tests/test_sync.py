@@ -457,9 +457,111 @@ state_path = "state/state.sqlite3"
         self.fixture.failing_page = 2
         _ = self.sync("--since", "2026-09-01", expect=1)
         self.fixture.failing_page = None
-        self.fixture.sessions[4]["timeListening"] = -5
+        self.fixture.sessions[4]["timeListening"] = "invalid"
         _ = self.sync("--since", "2026-09-01", expect=1)
         self.assertEqual(self.fixture.calls, [])
+
+    def test_negative_listening_time_is_deferred_and_reconsidered(self) -> None:
+        # Observed in an actual Lissen session returned by Audiobookshelf.
+        self.fixture.sessions = [
+            book("negative", at(0), -1.014),
+            book("A", at(1)),
+            book("B", at(2)),
+        ]
+        output = self.sync("--since", "2026-09-01", "--dry-run").output
+        self.assertIn("deferred", output)
+        self.assertIn("negative timeListening (-1.014)", output)
+        self.assertIn("would sync: created 2", output)
+        self.assertEqual(self.fixture.calls, [])
+        self.assertFalse(self.state.parent.exists())
+
+        _ = self.sync("--since", "2026-09-01")
+        self.assertEqual(self.fixture.calls, [created(at(1)), created(at(2))])
+        with sqlite3.connect(self.state) as conn:
+            self.assertEqual(set(Ledger(conn).rows()), {"A", "B"})
+            self.assertEqual(Ledger(conn).budget(self.clock.now, 25).available, 23)
+
+        self.fixture.sessions[0]["timeListening"] = 60.7
+        _ = self.sync()
+        self.assertEqual(self.fixture.calls[2:], [created(at(0), 60)])
+
+    def test_negative_listening_time_preserves_existing_entry(self) -> None:
+        self.fixture.sessions = [book("A", at(0))]
+        _ = self.sync("--since", "2026-09-01")
+        entry_id = self.fixture.entry_at(at(0))
+        with sqlite3.connect(self.state) as conn:
+            before = Ledger(conn).rows()["A"]
+
+        self.fixture.sessions[0]["timeListening"] = -1.014
+        self.fixture.sessions.append(book("B", at(1)))
+        _ = self.sync()
+        self.assertEqual(self.fixture.calls[1:], [created(at(1))])
+        self.assertEqual(self.fixture.entries[entry_id]["duration"], 1200)
+        with sqlite3.connect(self.state) as conn:
+            self.assertEqual(Ledger(conn).rows()["A"], before)
+
+        self.fixture.sessions[0]["timeListening"] = 900
+        _ = self.sync()
+        self.assertEqual(self.fixture.calls[2:], [updated(entry_id, at(0), 900)])
+
+    def test_negative_listening_time_defers_all_copies_of_session(self) -> None:
+        self.fixture.sessions = [
+            book("A", at(0), -1.014),
+            book("A", at(0)),
+            book("B", at(1)),
+            book("B", at(1), -5),
+            book("C", at(2)),
+        ]
+        _ = self.sync("--since", "2026-09-01")
+        self.assertEqual(self.fixture.calls, [created(at(2))])
+
+        self.fixture.sessions = [book("A", at(0)), book("B", at(1)), book("C", at(2))]
+        _ = self.sync()
+        self.assertEqual(self.fixture.calls[1:], [created(at(0)), created(at(1))])
+
+    def test_negative_listening_time_still_checks_user_identity(self) -> None:
+        self.fixture.sessions = [book("A", at(0)), book("B", at(1), -1.014)]
+        self.fixture.sessions[1]["userId"] = "another-user"
+        output = self.sync("--since", "2026-09-01", expect=1).output
+        self.assertIn("more than one user", output)
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_negative_listening_time_does_not_hide_other_invalid_fields(self) -> None:
+        cases: tuple[tuple[Json, str], ...] = (
+            ({"startedAt": 253_402_300_800_000}, "exceeds the calendar range"),
+            (
+                {"displayTitle": None, "mediaMetadata": None, "libraryItemId": None},
+                "no usable title or libraryItemId",
+            ),
+        )
+        for fields, error in cases:
+            for dry_run in (True, False):
+                with self.subTest(fields=fields, dry_run=dry_run):
+                    self.fixture.sessions = [
+                        book("A", at(0)),
+                        book("B", at(1), -1.014) | fields,
+                    ]
+                    args = ("--dry-run",) if dry_run else ()
+                    output = self.sync("--since", "2026-09-01", *args, expect=1).output
+                    self.assertIn(error, output)
+                    self.assertEqual(self.fixture.calls, [])
+
+    def test_malformed_source_times_still_stop_all_writes(self) -> None:
+        self.fixture.sessions = [book("A", at(0)), book("B", at(1))]
+        for key, value in (
+            ("timeListening", None),
+            ("timeListening", "-1.014"),
+            ("timeListening", True),
+            ("timeListening", math.nan),
+            ("timeListening", math.inf),
+            ("timeListening", -math.inf),
+            ("startedAt", -1),
+        ):
+            with self.subTest(key=key, value=value):
+                self.fixture.sessions[1] = book("B", at(1)) | {key: value}
+                output = self.sync("--since", "2026-09-01", expect=1).output
+                self.assertIn(f"invalid {key}", output)
+                self.assertEqual(self.fixture.calls, [])
 
     def test_budget_caps_requests_per_rolling_hour_across_runs(self) -> None:
         self.fixture.sessions = [book(f"S{index:02}", at(index)) for index in range(27)]
